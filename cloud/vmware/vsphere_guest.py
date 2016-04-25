@@ -1,4 +1,4 @@
-#!/usr/bin/env python2
+#!/usr/bin/python
 
 # -*- coding: utf-8 -*-
 # This file is part of Ansible
@@ -16,8 +16,6 @@
 # You should have received a copy of the GNU General Public License
 # along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
 
-# TODO:
-# Ability to set CPU/Memory reservations
 
 try:
     import json
@@ -34,6 +32,8 @@ try:
 except ImportError:
     pass
 
+import ssl
+
 DOCUMENTATION = '''
 ---
 module: vsphere_guest
@@ -48,6 +48,17 @@ options:
     required: true
     default: null
     aliases: []
+  validate_certs:
+    description:
+      - Validate SSL certs.  Note, if running on python without SSLContext
+        support (typically, python < 2.7.9) you will have to set this to C(no)
+        as pysphere does not support validating certificates on older python.
+        Prior to 2.1, this module would always validate on python >= 2.7.9 and
+        never validate on python <= 2.7.8.
+    required: false
+    default: yes
+    choices: ['yes', 'no']
+    version_added: 2.1
   guest:
     description:
       - The virtual server name you wish to manage.
@@ -79,7 +90,7 @@ options:
     default: null
   state:
     description:
-      - Indicate desired state of the vm. 'reconfigured' only applies changes to 'memory_mb' and 'num_cpus' in vm_hardware parameter, and only when hot-plugging is enabled for the guest.
+      - Indicate desired state of the vm. 'reconfigured' only applies changes to 'vm_cdrom', 'memory_mb', and 'num_cpus' in vm_hardware parameter. The 'memory_mb' and 'num_cpus' changes are applied to powered-on vms when hot-plugging is enabled for the guest.
     default: present
     choices: ['present', 'powered_off', 'absent', 'powered_on', 'restarted', 'reconfigured']
   from_template:
@@ -206,6 +217,7 @@ EXAMPLES = '''
 
 # Reconfigure the CPU and Memory on the newly created VM
 # Will return the changes made
+# Note: reserved_cpu is in MHz
 
 - vsphere_guest:
     vcenter_hostname: vcenter.mydomain.local
@@ -232,6 +244,8 @@ EXAMPLES = '''
       num_cpus: 4
       osid: centos64Guest
       scsi: paravirtual
+      reserved_memory: 4096
+      reserved_cpu: 13499
     esxi:
       datacenter: MyDatacenter
       hostname: esx001.mydomain.local
@@ -273,8 +287,22 @@ EXAMPLES = '''
   hw_guest_id: "rhel6_64Guest"
   hw_memtotal_mb: 2048
   hw_name: "centos64Guest"
+  hw_power_status: "POWERED ON",
   hw_processor_count: 2
   hw_product_uuid: "ef50bac8-2845-40ff-81d9-675315501dac"
+
+hw_power_status will be one of the following values:
+  - POWERED ON
+  - POWERED OFF
+  - SUSPENDED
+  - POWERING ON
+  - POWERING OFF
+  - SUSPENDING
+  - RESETTING
+  - BLOCKED ON MSG
+  - REVERTING TO SNAPSHOT
+  - UNKNOWN
+as seen in the VMPowerState-Class of PySphere: http://git.io/vlwOq
 
 # Remove a vm from vSphere
 # The VM must be powered_off or you need to use force to force a shutdown
@@ -500,7 +528,7 @@ def find_datastore(module, s, datastore, config_target):
                 datastore = d.Datastore.Name
                 break
     else:
-        for ds_mor, ds_name in server.get_datastores().items():
+        for ds_mor, ds_name in s.get_datastores().items():
             ds_props = VIProperty(s, ds_mor)
             if (ds_props.summary.accessible and (datastore and ds_name == datastore)
                     or (not datastore)):
@@ -595,6 +623,26 @@ def spec_singleton(spec, request, vm):
         spec = request.new_spec()
     return spec
 
+def get_cdrom_params(module, s, vm_cdrom):
+    cdrom_type = None
+    cdrom_iso_path = None
+    try:
+        cdrom_type = vm_cdrom['type']
+    except KeyError:
+        s.disconnect()
+        module.fail_json(
+            msg="Error on %s definition. cdrom type needs to be"
+            " specified." % vm_cdrom)
+    if cdrom_type == 'iso':
+        try:
+            cdrom_iso_path = vm_cdrom['iso_path']
+        except KeyError:
+            s.disconnect()
+            module.fail_json(
+                msg="Error on %s definition. cdrom iso_path needs"
+                " to be specified." % vm_cdrom)
+
+    return cdrom_type, cdrom_iso_path
 
 def vmdisk_id(vm, current_datastore_name):
     id_list = []
@@ -785,6 +833,7 @@ def reconfigure_vm(vsphere_client, vm, module, esxi, resource_pool, cluster_name
     request = None
     shutdown = False
     poweron = vm.is_powered_on()
+    devices = []
 
     memoryHotAddEnabled = bool(vm.properties.config.memoryHotAddEnabled)
     cpuHotAddEnabled = bool(vm.properties.config.cpuHotAddEnabled)
@@ -823,11 +872,54 @@ def reconfigure_vm(vsphere_client, vm, module, esxi, resource_pool, cluster_name
             # set the new RAM size
             spec.set_element_memoryMB(int(vm_hardware['memory_mb']))
             changes['memory'] = vm_hardware['memory_mb']
+
+    if 'reserved_memory' in vm_hardware:
+
+        if int(vm_hardware['reserved_memory']) != vm.properties.resourceConfig.memoryAllocation.reservation:
+            spec = spec_singleton(spec, request, vm)
+
+            if vm.is_powered_on():
+                if force:
+                    # No hot add but force
+                    if not memoryHotAddEnabled:
+                        shutdown = True
+                else:
+                    # Fail on no hot add and no force
+                    if not memoryHotAddEnabled:
+                        module.fail_json(
+                            msg="memoryHotAdd is not enabled. force is "
+                            "required for shutdown")
+            memory_allocation = spec.new_memoryAllocation()
+            memory_allocation.set_element_reservation(int(vm_hardware['reserved_memory']))
+            spec.set_element_memoryAllocation(memory_allocation)
+            changes['reserved_memory'] = vm_hardware['reserved_memory']
+
+    if 'reserved_cpu' in vm_hardware:
+
+        if int(vm_hardware['reserved_cpu']) != vm.properties.resourceConfig.cpuAllocation.reservation:
+            spec = spec_singleton(spec, request, vm)
+            if vm.is_powered_on():
+                if force:
+                    # No hot add but force
+                    if not cpuHotAddEnabled:
+                        shutdown = True
+                else:
+                    # Fail on no hot add and no force
+                    if not cpuHotAddEnabled:
+                        module.fail_json(
+                            msg="cpuHotAdd is not enabled. force is "
+                           "required for shutdown")
+
+            cpu_allocation = spec.new_cpuAllocation()
+            cpu_allocation.set_element_reservation(int(vm_hardware['reserved_cpu']))
+            spec.set_element_cpuAllocation(cpu_allocation)
+            changes['reserved_cpu'] = vm_hardware['reserved_cpu']
+
     # ===( Reconfigure Network )====#
     if vm_nic:
         changed = reconfigure_net(vsphere_client, vm, module, esxi, resource_pool, guest, vm_nic, cluster_name)
 
-    # ====( Config Memory )====#
+    # Change Num CPUs
     if 'num_cpus' in vm_hardware:
         if int(vm_hardware['num_cpus']) != vm.properties.config.hardware.numCPU:
             spec = spec_singleton(spec, request, vm)
@@ -858,6 +950,93 @@ def reconfigure_vm(vsphere_client, vm, module, esxi, resource_pool, cluster_name
 
             changes['cpu'] = vm_hardware['num_cpus']
 
+    # Change CDROM
+    if 'vm_cdrom' in vm_hardware:
+        spec = spec_singleton(spec, request, vm)
+
+        cdrom_type, cdrom_iso_path = get_cdrom_params(module, vsphere_client, vm_hardware['vm_cdrom'])
+
+        cdrom = None
+        current_devices = vm.properties.config.hardware.device
+
+        for dev in current_devices:
+            if dev._type == 'VirtualCdrom':
+                cdrom = dev._obj
+                break
+
+        if cdrom_type == 'iso':
+            iso_location = cdrom_iso_path.split('/', 1)
+            datastore, ds = find_datastore(
+                module, vsphere_client, iso_location[0], None)
+            iso_path = iso_location[1]
+            iso = VI.ns0.VirtualCdromIsoBackingInfo_Def('iso').pyclass()
+            iso.set_element_fileName('%s %s' % (datastore, iso_path))
+            cdrom.set_element_backing(iso)
+            cdrom.Connectable.set_element_connected(True)
+            cdrom.Connectable.set_element_startConnected(True)
+        elif cdrom_type == 'client':
+            client = VI.ns0.VirtualCdromRemoteAtapiBackingInfo_Def('client').pyclass()
+            client.set_element_deviceName("")
+            cdrom.set_element_backing(client)
+            cdrom.Connectable.set_element_connected(True)
+            cdrom.Connectable.set_element_startConnected(True)
+        else:
+            vsphere_client.disconnect()
+            module.fail_json(
+                msg="Error adding cdrom of type %s to vm spec. "
+                " cdrom type can either be iso or client" % (cdrom_type))
+
+        dev_change = spec.new_deviceChange()
+        dev_change.set_element_device(cdrom)
+        dev_change.set_element_operation('edit')
+        devices.append(dev_change)
+
+        changes['cdrom'] = vm_hardware['vm_cdrom']
+
+    # Resize hard drives
+    if vm_disk:
+        spec = spec_singleton(spec, request, vm)
+
+        # Get a list of the VM's hard drives
+        dev_list = [d for d in vm.properties.config.hardware.device if d._type=='VirtualDisk']
+        if len(vm_disk) > len(dev_list):
+            vsphere_client.disconnect()
+            module.fail_json(msg="Error in vm_disk definition. Too many disks defined in comparison to the VM's disk profile.")
+
+        disk_num = 0
+        dev_changes = []
+        disks_changed = {}
+        for disk in sorted(vm_disk.iterkeys()):
+            try:
+                disksize = int(vm_disk[disk]['size_gb'])
+                # Convert the disk size to kilobytes
+                disksize = disksize * 1024 * 1024
+            except (KeyError, ValueError):
+                vsphere_client.disconnect()
+                module.fail_json(msg="Error in '%s' definition. Size needs to be specified as an integer." % disk)
+
+            # Make sure the new disk size is higher than the current value
+            dev = dev_list[disk_num]
+            if disksize < int(dev.capacityInKB):
+              vsphere_client.disconnect()
+              module.fail_json(msg="Error in '%s' definition. New size needs to be higher than the current value (%s GB)." % (disk, int(dev.capacityInKB) / 1024 / 1024))
+
+            # Set the new disk size
+            elif disksize > int(dev.capacityInKB):
+                dev_obj = dev._obj
+                dev_obj.set_element_capacityInKB(disksize)
+                dev_change = spec.new_deviceChange()
+                dev_change.set_element_operation("edit")
+                dev_change.set_element_device(dev_obj)
+                dev_changes.append(dev_change)
+                disks_changed[disk] = {'size_gb': int(vm_disk[disk]['size_gb'])}
+
+            disk_num = disk_num + 1
+
+        if dev_changes:
+            spec.set_element_deviceChange(dev_changes)
+            changes['disks'] = disks_changed
+
     if len(changes):
 
         if shutdown and vm.is_powered_on():
@@ -869,6 +1048,9 @@ def reconfigure_vm(vsphere_client, vm, module, esxi, resource_pool, cluster_name
                 module.fail_json(
                     msg='Failed to shutdown vm %s: %s' % (guest, e)
                 )
+
+        if len(devices):
+            spec.set_element_deviceChange(devices)
 
         request.set_element_spec(spec)
         ret = vsphere_client._proxy.ReconfigVM_Task(request)._returnval
@@ -1208,23 +1390,7 @@ def create_vm(vsphere_client, module, esxi, resource_pool, cluster_name, guest, 
             disk_num = disk_num + 1
             disk_key = disk_key + 1
     if 'vm_cdrom' in vm_hardware:
-        cdrom_iso_path = None
-        cdrom_type = None
-        try:
-            cdrom_type = vm_hardware['vm_cdrom']['type']
-        except KeyError:
-            vsphere_client.disconnect()
-            module.fail_json(
-                msg="Error on %s definition. cdrom type needs to be"
-                " specified." % vm_hardware['vm_cdrom'])
-        if cdrom_type == 'iso':
-            try:
-                cdrom_iso_path = vm_hardware['vm_cdrom']['iso_path']
-            except KeyError:
-                vsphere_client.disconnect()
-                module.fail_json(
-                    msg="Error on %s definition. cdrom iso_path needs"
-                    " to be specified." % vm_hardware['vm_cdrom'])
+        cdrom_type, cdrom_iso_path = get_cdrom_params(module, vsphere_client, vm_hardware['vm_cdrom'])
         # Add a CD-ROM device to the VM.
         add_cdrom(module, vsphere_client, config_target, config, devices,
                   default_devs, cdrom_type, cdrom_iso_path)
@@ -1308,9 +1474,10 @@ def create_vm(vsphere_client, module, esxi, resource_pool, cluster_name, guest, 
         # Power on the VM if it was requested
         power_state(vm, state, True)
 
+        vmfacts=gather_facts(vm)
         vsphere_client.disconnect()
         module.exit_json(
-            ansible_facts=gather_facts(vm),
+            ansible_facts=vmfacts,
             changed=True,
             changes="Created VM %s" % guest)
 
@@ -1404,6 +1571,7 @@ def gather_facts(vm):
     facts = {
         'module_hw': True,
         'hw_name': vm.properties.name,
+        'hw_power_status': vm.get_status(),
         'hw_guest_full_name':  vm.properties.config.guestFullName,
         'hw_guest_id': vm.properties.config.guestId,
         'hw_product_uuid': vm.properties.config.uuid,
@@ -1507,7 +1675,9 @@ def main():
         'memory_mb': int,
         'num_cpus': int,
         'scsi': basestring,
-        'osid': basestring
+        'osid': basestring,
+        'reserved_memory': int,
+        'reserved_cpu': int
     }
 
     proto_vm_disk = {
@@ -1533,9 +1703,18 @@ def main():
 
     module = AnsibleModule(
         argument_spec=dict(
-            vcenter_hostname=dict(required=True, type='str'),
-            username=dict(required=True, type='str'),
-            password=dict(required=True, type='str', no_log=True),
+            vcenter_hostname=dict(
+                type='str',
+                default=os.environ.get('VMWARE_HOST')
+            ),
+            username=dict(
+                type='str',
+                default=os.environ.get('VMWARE_USER')
+            ),
+            password=dict(
+                type='str', no_log=True,
+                default=os.environ.get('VMWARE_PASSWORD')
+            ),
             state=dict(
                 required=False,
                 choices=[
@@ -1561,6 +1740,7 @@ def main():
             cluster=dict(required=False, default=None, type='str'),
             force=dict(required=False, type='bool', default=False),
             esxi=dict(required=False, type='dict', default={}),
+            validate_certs=dict(required=False, type='bool', default=True),
             power_on_after_clone=dict(required=False, type='bool', default=True)
 
 
@@ -1602,12 +1782,26 @@ def main():
     from_template = module.params['from_template']
     snapshot_to_clone = module.params['snapshot_to_clone']
     power_on_after_clone = module.params['power_on_after_clone']
+    validate_certs = module.params['validate_certs']
 
 
     # CONNECT TO THE SERVER
     viserver = VIServer()
+    if validate_certs and not hasattr(ssl, 'SSLContext') and not vcenter_hostname.startswith('http://'):
+        module.fail_json(msg='pysphere does not support verifying certificates with python < 2.7.9.  Either update python or set validate_certs=False on the task')
+
     try:
         viserver.connect(vcenter_hostname, username, password)
+    except ssl.SSLError as sslerr:
+        if '[SSL: CERTIFICATE_VERIFY_FAILED]' in sslerr.strerror:
+            if not validate_certs:
+                default_context = ssl._create_default_https_context
+                ssl._create_default_https_context = ssl._create_unverified_context
+                viserver.connect(vcenter_hostname, username, password)
+            else:
+                module.fail_json(msg='Unable to validate the certificate of the vcenter host %s' % vcenter_hostname)
+        else:
+            raise
     except VIApiException, err:
         module.fail_json(msg="Cannot connect to %s: %s" %
                          (vcenter_hostname, err))
