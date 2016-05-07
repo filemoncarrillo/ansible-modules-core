@@ -1550,7 +1550,7 @@ def main():
         'num_cpus': int,
         'scsi': basestring,
         'osid': basestring,
-	'reserved_memory': int,
+        'reserved_memory': int,
         'reserved_cpu': int
     }
 
