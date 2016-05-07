@@ -203,7 +203,7 @@ EXAMPLES = '''
 
 # Reconfigure the CPU and Memory on the newly created VM
 # Will return the changes made
-# Note: reserved_cpu is in MHz
+# Note: reserved_cpu is in MHz 
 
 - vsphere_guest:
     vcenter_hostname: vcenter.mydomain.local
