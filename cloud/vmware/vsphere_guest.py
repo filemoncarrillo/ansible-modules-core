@@ -825,7 +825,7 @@ def reconfigure_vm(vsphere_client, vm, module, esxi, resource_pool, cluster_name
             changes['memory'] = vm_hardware['memory_mb']
 
     if 'reserved_memory' in vm_hardware:
-	    
+    
         if int(vm_hardware['reserved_memory']) != vm.properties.resourceConfig.memoryAllocation.reservation:
             spec = spec_singleton(spec, request, vm)
     
@@ -1550,7 +1550,7 @@ def main():
         'num_cpus': int,
         'scsi': basestring,
         'osid': basestring,
-	'reserved_memory': int,
+        'reserved_memory': int,
         'reserved_cpu': int
     }
 
