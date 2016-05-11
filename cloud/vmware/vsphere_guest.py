@@ -114,7 +114,7 @@ options:
     default: null
     reserved_memory : new_value 
     reserved_cpu: new_value
-      version_added: "2.2"
+    version_added: "2.2"
   vm_nic:
     description:
       - A key, value list of nics, their types and what network to put them on.
