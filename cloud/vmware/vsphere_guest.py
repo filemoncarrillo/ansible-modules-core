@@ -112,7 +112,8 @@ options:
       - A key, value list of VM config settings. Must include ['memory_mb', 'num_cpus', 'osid', 'scsi', 'reserved_memory', 'reserved_cpu'].
     required: false
     default: null
-    reserved_memory and reserved_cpu
+    reserved_memory : new_value 
+    reserved_cpu: new_value
       version_added: "2.2"
   vm_nic:
     description:
