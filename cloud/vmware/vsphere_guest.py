@@ -264,6 +264,7 @@ EXAMPLES = '''
 
 # Typical output of a vsphere_facts run on a guest
 # If vmware tools is not installed, ipadresses with return None
+# hw_reserved_cpu is in MHz
 
 - hw_eth0:
   - addresstype: "assigned"
@@ -278,6 +279,8 @@ EXAMPLES = '''
   hw_name: "centos64Guest"
   hw_processor_count: 2
   hw_product_uuid: "ef50bac8-2845-40ff-81d9-675315501dac"
+  hw_reserved_cpu: 10999 
+  hw_reserved_memory: 2048
 
 # Remove a vm from vSphere
 # The VM must be powered_off or you need to use force to force a shutdown
@@ -1454,6 +1457,8 @@ def gather_facts(vm):
         'hw_product_uuid': vm.properties.config.uuid,
         'hw_processor_count': vm.properties.config.hardware.numCPU,
         'hw_memtotal_mb': vm.properties.config.hardware.memoryMB,
+        'hw_reserved_cpu': vm.properties.resourceConfig.cpuAllocation.reservation,
+        'hw_reserved_memory': vm.properties.resourceConfig.memoryAllocation.reservation,
         'hw_interfaces':[],
     }
     netInfo = vm.get_property('net')
