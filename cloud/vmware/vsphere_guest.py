@@ -109,11 +109,11 @@ options:
     default: null
   vm_hardware:
     description:
-      - A key, value list of VM config settings. Must include ['memory_mb', 'num_cpus', 'osid', 'scsi', 'reserved_memory', 'reserved_cpu'].
+      - A key, value list of VM config settings. Must include ['memory_mb', 'num_cpus', 'osid', 'scsi'].
     required: false
     default: null
-    reserved_memory : new_value 
-    reserved_cpu: new_value
+    reserved_description:
+      - A key, value list of VM hardware settings. Optional fields are ['reserved_memory', 'reserved_cpu'].
     version_added: "2.2"
   vm_nic:
     description:
